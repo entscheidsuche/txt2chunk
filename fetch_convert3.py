@@ -48,7 +48,7 @@ it_r=re.compile(r"\b(?:"+"|".join(WOERTER["it"])+r")\b")
 
 
 REGS={'de': de_r, 'fr': fr_r, 'it': it_r}
-CACHE_VALID="10.04.2026 14:45:00"
+CACHE_VALID="14.04.2026 06:00:00"
 DATE_FORMAT="%d.%m.%Y %H:%M:%S"
 cache_limit=datetime.datetime.strptime(CACHE_VALID,DATE_FORMAT)
 
@@ -572,7 +572,7 @@ def get_chunks(text, chunk_size, dokid, lang, obj, filename, intro) -> list:
 		chunktext = text[start:start+pos]
 
 		chunk={}
-		chunk['id']=write_chunk(chunktext, chunknum, chunkobj, filename, intro)
+		chunk=write_chunk(chunktext, chunknum, chunkobj, filename, intro)
 		chunk['offset']=start
 		chunk['len']=pos
 		chunks.append(chunk)
@@ -581,7 +581,7 @@ def get_chunks(text, chunk_size, dokid, lang, obj, filename, intro) -> list:
 
 	# Rest korrekt schreiben:
 	chunk={}
-	chunk['id']=write_chunk(text[start:], chunknum, chunkobj, filename, intro)
+	chunk=write_chunk(text[start:], chunknum, chunkobj, filename, intro)
 	chunk['offset']=start
 	chunk['len']=len(text)-start
 	chunks.append(chunk)

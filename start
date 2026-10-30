@@ -1,0 +1,3 @@
+
+source venv/bin/activate
+python3 -m uvicorn fetch_convert3:app --host 0.0.0.0 --port 8001 --workers 4
