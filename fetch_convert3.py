@@ -11,9 +11,12 @@ import subprocess
 from typing import Dict
 import json
 import copy
+import tempfile
 
 import requests
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import PlainTextResponse
+from functools import lru_cache
 from pydantic import BaseModel
 import trafilatura
 import datetime
@@ -38,6 +41,14 @@ BASE_URL = "https://entscheidsuche.ch/docs"
 DATA_DIR = Path("/var/www/files/chunks")
 DATA_URL = "https://files.entscheidsuche.ch/chunks/"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+# Einzelne Chunk-Dateien (_C####.json, _MC#####.txt) schreiben? Sie werden nicht mehr benoetigt, sobald
+# die Chunk-URLs auf GET /chunks/... zeigen (Berechnung aus <dok>.json und <dok>.txt). Dann auf False setzen.
+WRITE_CHUNK_FILES = True
+# <dok>_C0001.json bzw. <dok>_MC00001.txt, <dok> wie unter DATA_DIR abgelegt (mit Unterverzeichnissen)
+CHUNK_PATH_REGEX = re.compile(r'^(?P<doc>[\w\-./]+)_(?:(?P<big>C\d{4})\.json|(?P<micro>MC\d{5})\.txt)$')
+# Lokaler Zugriff auf die Dokumente (lokales Pendant zu BASE_URL); Fallback ist HTTP
+DOCS_DIR = Path("/home/entsche1/public_html/entscheide/docs")
+FACETTEN_FILE = DOCS_DIR / "Facetten_alle.json"   # Zuordnung Kammer -> Spider-Verzeichnis
 FILENAME_REGEX = re.compile(r'^[\w\-.]+$')  # erlaubt a-zA-Z0-9 _ - . ; verhindert Slashes und Traversal
 DOPPELUMBRUCH_REGEX = re.compile(r'(?s).*\n\n', flags=re.MULTILINE)
 NUMMER_REGEX = re.compile(r'(?s).*^(?P<line>[\.\dA-Za-z]{1,4})$', flags=re.MULTILINE)
@@ -166,57 +177,69 @@ def download_from_url(url: str, dest: Path, timeout: int = 20) -> None:
 		tmp_path.replace(dest)
 	return True
 
-def fetch_pdf_html_for_name(name: str, destPDF: Path, destHTML: Path, timeout: int = 20) -> (str, dict):
-	"""
-	Check for a JSON at BASE_URL/<name>.json. If present and contains
-	{'PDF': {'Datei': <path>}}, use that path to download the PDF.
-	Otherwise fall back to BASE_URL/<name>.pdf.
+_facetten = {"map": {}, "mtime": None}
 
-	<path> may be:
-	- an absolute URL (starts with http/https) -> used as-is
-	- a relative path like "subdir/file.pdf" or "/subdir/file.pdf" -> joined with BASE_URL
-	- just a filename -> treated as relative to BASE_URL
-	"""
-	json_url = f"{BASE_URL}/{name}.json"
-	if DEBUG:
-		print(f"fetch_pdf_html_for_name: url: {json_url}, pdf_path: {destPDF}, html_path {destHTML}")
+def build_map(data: dict) -> dict:
+	"""Kammer-ID (z.B. ZH_OG_002) -> Spider-Verzeichnis aus Facetten_alle.json"""
+	m = {}
+	for kanton in data.values():
+		gerichte = kanton.get("gerichte") if isinstance(kanton, dict) else None
+		for gericht in (gerichte or {}).values():
+			kammern = gericht.get("kammern") if isinstance(gericht, dict) else None
+			if isinstance(kammern, dict):
+				for kammer_id, k in kammern.items():
+					if isinstance(k, dict) and k.get("spider"):
+						m[kammer_id] = k["spider"]
+	return m
 
-	resp = requests.get(json_url, timeout=timeout)
+def _kammer_map() -> dict:
+	"""Liest Facetten_alle.json neu, sobald sich die mtime ändert. Bei Lesefehler (z.B. Datei wird gerade
+	vom Scraper geschrieben) bleibt die bisherige Zuordnung aktiv."""
+	try:
+		mtime = FACETTEN_FILE.stat().st_mtime_ns
+	except FileNotFoundError:
+		return _facetten["map"]
+	if mtime != _facetten["mtime"]:
+		try:
+			with FACETTEN_FILE.open(encoding="utf-8") as f:
+				_facetten["map"] = build_map(json.load(f))
+			_facetten["mtime"] = mtime
+		except (json.JSONDecodeError, OSError) as e:
+			print(f"Facetten_alle.json nicht lesbar ({e}), verwende bisherige Zuordnung")
+	return _facetten["map"]
 
+def spider_for(dokid: str) -> str | None:
+	return _kammer_map().get("_".join(dokid.split("_")[:3]))
 
-	if resp.status_code == 200:
-		# try to parse JSON
-		obj = resp.json()
+def local_doc(rel: str) -> Path | None:
+	"""Pfad relativ zu DOCS_DIR; None, wenn nicht vorhanden oder ausserhalb von DOCS_DIR."""
+	p = (DOCS_DIR / rel.lstrip("/")).resolve()
+	if DOCS_DIR.resolve() not in p.parents:
+		return None
+	return p if p.is_file() else None
 
-		# navigate structure safely
-		pdf_field = None
-		html_field = None
-		if isinstance(obj, dict):
-			pdf_info = obj.get("PDF")
-			if isinstance(pdf_info, dict):
-				pdf_field = pdf_info.get("Datei")
-			html_info = obj.get("HTML")
-			if isinstance(html_info, dict):
-				html_field = html_info.get("Datei")
-		if pdf_field:
-			# determine final URL
-			pdf_field_str = str(pdf_field).strip()
-			pdf_url = f"{BASE_URL}/{pdf_field_str}"
-			# download from determined URL (may raise FileNotFoundError)
-			if download_from_url(pdf_url, destPDF, timeout=timeout):
-				return "pdf", obj
-		if html_field:
-			# determine final URL
-			html_field_str = str(html_field).strip()
-			html_url = f"{BASE_URL}/{html_field_str}"
-			# download from determined URL (may raise FileNotFoundError)
-			download_from_url(html_url, destHTML, timeout=timeout)
-			return "html", obj
-		else:
-			print("weder PDF noch HTML vorhanden")
-			return None, obj
-	else:
-		return None, None
+def is_local(p: Path) -> bool:
+	return DOCS_DIR.resolve() in p.resolve().parents
+
+def resolve_source(obj: dict, timeout: int = 20) -> tuple[str | None, Path | None]:
+	"""Liefert ('pdf'|'html', Pfad). Lokale Originale werden direkt verwendet (keine Kopie).
+	Nur wenn lokal nicht vorhanden, wird in eine temporaere Datei heruntergeladen."""
+	for kind, key in (("pdf", "PDF"), ("html", "HTML")):
+		info = obj.get(key)
+		rel = info.get("Datei") if isinstance(info, dict) else None
+		if not rel:
+			continue
+		rel = str(rel).strip()
+		p = local_doc(rel)
+		if p:
+			return kind, p
+		fd, tmp_name = tempfile.mkstemp(suffix=f".{kind}")
+		os.close(fd)
+		tmp = Path(tmp_name)
+		if download_from_url(f"{BASE_URL}/{rel}", tmp, timeout=timeout):
+			return kind, tmp
+		tmp.unlink(missing_ok=True)
+	return None, None
 
 
 def run_pdftotext(pdf_path: Path, txt_path: Path) -> None:
@@ -245,7 +268,7 @@ def run_htmltotext(html_path: Path, txt_path: Path) -> None:
 	  - RuntimeError bei Extraktionsfehlern
 	"""
 	if DEBUG:
-		print(f"run_htmltotext: pdf_path: {pdf_path}, txt_path {txt_path}")
+		print(f"run_htmltotext: html_path: {html_path}, txt_path {txt_path}")
 
 	if not html_path.exists():
 		raise FileNotFoundError(f"Local HTML not found: {html_path}")
@@ -268,13 +291,13 @@ def convert_get(dokid: str = Query(..., min_length=1)):
 	except ValueError as e:
 		raise HTTPException(status_code=400, detail=str(e))
 
-	pdf_path = DATA_DIR / f"{filename}.pdf"
-	html_path = DATA_DIR / f"{filename}.html"
 	txt_path = DATA_DIR / f"{filename}.txt"
 	json_path = DATA_DIR / f"{filename}.json"
 
 
 	obj=get_json(dokid)
+	if obj is None:
+		raise HTTPException(status_code=404, detail=f"Dokument {dokid} nicht gefunden")
 	scrapetime = datetime.datetime.strptime(obj["Zeit UTC"], DATE_FORMAT).replace(tzinfo=datetime.timezone.utc).astimezone().replace(tzinfo=None)
 	
 	#Gibt es bereits ein json mit Chunkzerlegung?
@@ -291,17 +314,23 @@ def convert_get(dokid: str = Query(..., min_length=1)):
 					imCache=True
 	
 	if not imCache:
+		src=None
 		try:
-			path = Path(txt_path)
-			path.parent.mkdir(parents=True, exist_ok=True)
-			result, obj=fetch_pdf_html_for_name(dokid, pdf_path, html_path)
-			ok=False
-			if result=="pdf":
-				ok=run_pdftotext(pdf_path, txt_path)
-			if result=="html":
-				run_htmltotext(html_path, txt_path)
+			txt_path.parent.mkdir(parents=True, exist_ok=True)
+			kind, src = resolve_source(obj)
+			if kind=="pdf":
+				run_pdftotext(src, txt_path)
+			elif kind=="html":
+				run_htmltotext(src, txt_path)
+			else:
+				raise HTTPException(status_code=404, detail=f"weder PDF noch HTML fuer {dokid}")
+		except HTTPException:
+			raise
 		except Exception as e:
 			raise HTTPException(status_code=500, detail=str(e))
+		finally:
+			if src and not is_local(src):
+				src.unlink(missing_ok=True)   # nur Temp-Downloads loeschen, nie Originale
 
 		if not txt_path.exists():
 			raise HTTPException(status_code=500, detail=f"Text output not created {txt_path}")
@@ -330,6 +359,59 @@ def convert_get(dokid: str = Query(..., min_length=1)):
 				json.dump(obj, f, ensure_ascii=False, indent=2)
 		
 	return obj
+
+@lru_cache(maxsize=32)
+def _load_chunk_doc(filename: str, json_mtime: int, txt_mtime: int):
+	"""Liest <dok>.json und <dok>.txt fuer die Chunk-Berechnung. Die mtimes gehoeren zum Cache-Schluessel,
+	damit ein neu zerlegtes Dokument nicht aus dem Cache bedient wird."""
+	with (DATA_DIR / f"{filename}.json").open("r", encoding="utf-8") as fh:
+		obj = json.load(fh)
+	text = (DATA_DIR / f"{filename}.txt").read_text(encoding="utf-8", errors="replace")
+	big = {}
+	micro = {}
+	for c in obj.get("Chunks") or []:
+		big[c["id"]] = c
+		for mc in c.get("MicroChunks") or []:
+			micro[mc["id"]] = mc
+	meta = {k: v for k, v in obj.items() if k not in ("Chunks", "Chunktime")}
+	intro = get_intro(obj, obj.get("Sprache"))
+	return meta, text, intro, big, micro
+
+@app.get("/chunks/{chunk_path:path}")
+def chunk_get(chunk_path: str):
+	"""
+	GET /chunks/<dok>_C0001.json  -> grosser Chunk (Metadaten + Chunktext) als JSON
+	GET /chunks/<dok>_MC00001.txt -> Micro-Chunk als Text
+	Ersetzt die frueher einzeln abgelegten Chunk-Dateien: der Chunk wird aus <dok>.json (Offsets)
+	und <dok>.txt (Text) berechnet. Das Dokument muss vorher mit /convert zerlegt worden sein.
+	"""
+	m = CHUNK_PATH_REGEX.match(chunk_path)
+	if not m:
+		raise HTTPException(status_code=404, detail=f"kein Chunk-Name: {chunk_path}")
+	filename = m.group("doc")
+	json_path = DATA_DIR / f"{filename}.json"
+	txt_path = DATA_DIR / f"{filename}.txt"
+	if DATA_DIR.resolve() not in json_path.resolve().parents:
+		raise HTTPException(status_code=404, detail=f"kein Chunk-Name: {chunk_path}")
+	try:
+		json_mtime = json_path.stat().st_mtime_ns
+		txt_mtime = txt_path.stat().st_mtime_ns
+	except (FileNotFoundError, NotADirectoryError):
+		raise HTTPException(status_code=404, detail=f"Dokument zu {chunk_path} ist nicht zerlegt")
+	meta, text, intro, big, micro = _load_chunk_doc(filename, json_mtime, txt_mtime)
+
+	if m.group("big"):
+		c = big.get(f"{filename}_{m.group('big')}")
+		if c is None:
+			raise HTTPException(status_code=404, detail=f"Chunk {chunk_path} nicht gefunden")
+		chunkobj = dict(meta)
+		chunkobj["Chunktext"] = intro+"\n\n"+normalize_ws(text[c["offset"]:c["offset"]+c["len"]])
+		return chunkobj
+
+	mc = micro.get(f"{filename}_{m.group('micro')}")
+	if mc is None:
+		raise HTTPException(status_code=404, detail=f"Chunk {chunk_path} nicht gefunden")
+	return PlainTextResponse(normalize_ws(text[mc["offset"]:mc["offset"]+mc["len"]]))
 
 def get_intro(obj, lang) -> str:
 	intro=""
@@ -376,9 +458,10 @@ def write_chunk(chunk, chunknum, chunkobj, filename, intro) -> {}:
 	chunkurl=DATA_URL+chunkname+".json"
 	chunkid={"id":chunkname, "url":chunkurl}
 	chunkobj['Chunktext']=intro+"\n\n"+normalize_ws(chunk)
-	chunkpath=DATA_DIR / f"{chunkname}.json"
-	with chunkpath.open("w", encoding="utf-8") as f:
-		json.dump(chunkobj, f, ensure_ascii=False)
+	if WRITE_CHUNK_FILES:
+		chunkpath=DATA_DIR / f"{chunkname}.json"
+		with chunkpath.open("w", encoding="utf-8") as f:
+			json.dump(chunkobj, f, ensure_ascii=False)
 	return chunkid
 
 def write_micro_chunk(text, chunknum, filename) -> {}:
@@ -387,9 +470,10 @@ def write_micro_chunk(text, chunknum, filename) -> {}:
 		chunkurl=DATA_URL+chunkid+".txt"
 		chunk['id']=chunkid
 		chunk['url']=chunkurl
-		chunkpath=DATA_DIR / f"{chunkid}.txt"
-		with chunkpath.open("w", encoding="utf-8") as f:
-			f.write(normalize_ws(text))
+		if WRITE_CHUNK_FILES:
+			chunkpath=DATA_DIR / f"{chunkid}.txt"
+			with chunkpath.open("w", encoding="utf-8") as f:
+				f.write(normalize_ws(text))
 		return chunk
 
 
@@ -587,13 +671,15 @@ def get_chunks(text, chunk_size, dokid, lang, obj, filename, intro) -> list:
 	chunks.append(chunk)
 	return chunks
 
-def get_json(name) -> dict:
+def get_json(name) -> dict | None:
+	"""Dokument-JSON lokal aus DOCS_DIR/<spider>/<name>.json, sonst per HTTP."""
+	spider = spider_for(name)
+	p = local_doc(f"{spider}/{name}.json") if spider else None
+	if p:
+		with p.open(encoding="utf-8") as f:
+			return json.load(f)
 	json_url = f"{BASE_URL}/{name}.json"
 	resp = requests.get(json_url, timeout=20)
-
 	if resp.status_code == 200:
-		# try to parse JSON
-		obj = resp.json()
-		return obj
-	else:
-		return None
+		return resp.json()
+	return None
