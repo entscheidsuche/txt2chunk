@@ -43,7 +43,7 @@ DATA_URL = "https://files.entscheidsuche.ch/chunks/"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 # Einzelne Chunk-Dateien (_C####.json, _MC#####.txt) schreiben? Sie werden nicht mehr benoetigt, sobald
 # die Chunk-URLs auf GET /chunks/... zeigen (Berechnung aus <dok>.json und <dok>.txt). Dann auf False setzen.
-WRITE_CHUNK_FILES = True
+WRITE_CHUNK_FILES = False
 # <dok>_C0001.json bzw. <dok>_MC00001.txt, <dok> wie unter DATA_DIR abgelegt (mit Unterverzeichnissen)
 CHUNK_PATH_REGEX = re.compile(r'^(?P<doc>[\w\-./]+)_(?:(?P<big>C\d{4})\.json|(?P<micro>MC\d{5})\.txt)$')
 # Lokaler Zugriff auf die Dokumente (lokales Pendant zu BASE_URL); Fallback ist HTTP
